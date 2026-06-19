@@ -3,33 +3,38 @@
 Large language model (LLM) agents are rapidly evolving from conversational
 assistants into autonomous system operators capable of executing shell commands,
 manipulating filesystems, launching subprocesses, and interacting with complex
-software environments. This autonomy introduces a fundamental security
+software environments~\cite{yao2022react,schick2023toolformer,yang2024sweagent}.
+This autonomy introduces a fundamental security
 challenge: hallucinations, prompt injections, compromised context, or malicious
-tools can be translated into concrete system actions at machine speed. We adopt
-a strict threat model: the host operating system and \SystemName's trusted
-runtime components are trusted, while the agent framework, its generated
-instructions, permission declarations, and invoked binaries are treated as
-potentially malicious.
+tools can be translated into concrete system actions at machine
+speed~\cite{greshake2023indirect,debenedetti2024agentdojo}. We adopt a strict
+threat model: the host operating system and \SystemName's trusted runtime
+components are trusted, while the agent framework, its generated instructions,
+permission declarations, and invoked binaries are treated as potentially
+malicious.
 
 Existing agent deployments often grant tools broad filesystem and network
 access. In such settings, a single successful injection can exfiltrate sensitive
 files, corrupt project state, or interact with remote services on the user's
-behalf. Securing agents therefore requires authorization mechanisms that
-precisely constrain resource accesses according to the intended task. Because
-agents routinely invoke shells, interpreters, package managers, and arbitrary
-binaries, these constraints must ultimately be enforced at the operating-system
-boundary rather than only within the application framework.
+behalf~\cite{greshake2023indirect,debenedetti2024agentdojo,debenedetti2025camel}.
+Securing agents therefore requires authorization mechanisms that precisely
+constrain resource accesses according to the intended task, reflecting the
+principle of least privilege~\cite{saltzer1975protection}. Because agents
+routinely invoke shells, interpreters, package managers, and arbitrary binaries,
+these constraints must ultimately be enforced at the operating-system boundary
+rather than only within the application framework~\cite{watson2010capsicum,wright2002lsm}.
 
 The central difficulty is the semantic gap between agent intent and kernel
 enforcement. Operating systems reason about files, sockets, capabilities,
 processes, and system calls, whereas agent objectives are expressed through
 natural-language instructions and tool invocations. Existing approaches attempt
 to bridge this gap using task-level sandboxing, LLM-generated policies, or
-per-invocation validation, but they face a three-way tension among semantic
-precision, enforcement strength, and execution latency. Coarse task-level
-policies fail to capture dynamic runtime behavior; per-invocation semantic
-validation improves precision but places LLM reasoning on the critical path; and
-kernel isolation provides strong enforcement but lacks task-level context.
+per-invocation validation~\cite{debenedetti2025camel,xiang2024guardagent}, but
+they face a three-way tension among semantic precision, enforcement strength,
+and execution latency. Coarse task-level policies fail to capture dynamic
+runtime behavior; per-invocation semantic validation improves precision but
+places LLM reasoning on the critical path; and kernel isolation provides strong
+enforcement but lacks task-level context.
 
 This paper argues that these properties need not be tightly coupled. Our key
 insight is to separate \emph{kernel-enforced confinement} from \emph{semantic
@@ -47,12 +52,12 @@ authorization, kernel-level enforcement, and speculative execution.
 \SystemName treats agent-supplied permission declarations as untrusted input. A
 deterministic compiler translates each declaration into a bounded, auditable,
 kernel-enforceable policy, which the runtime installs before transferring
-control to untrusted tool code. The tool executes under eBPF/LSM confinement,
-while a trusted semantic validator concurrently evaluates the task context,
-accepted permissions, and pending release request. Outputs, filesystem changes,
-and externally visible effects are released only after semantic approval;
-otherwise, speculative state is discarded and the invocation-scoped policy is
-revoked.
+control to untrusted tool code. The tool executes under eBPF/LSM
+confinement~\cite{gbadamosi2024ebpf,wright2002lsm}, while a trusted semantic
+validator concurrently evaluates the task context, accepted permissions, and
+pending release request. Outputs, filesystem changes, and externally visible
+effects are released only after semantic approval; otherwise, speculative state
+is discarded and the invocation-scoped policy is revoked.
 
 \SystemName consists of three core mechanisms. First,
 \emph{Semantic-to-Kernel Intermediate Representation (SK-IR)} deterministically
