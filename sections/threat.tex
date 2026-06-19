@@ -1,0 +1,101 @@
+\section{Threat Model}
+\label{sec:threat}
+
+\subsection{System Model and Trust Boundary}
+\label{sec:threat:trust}
+
+\SystemName targets LLM-agent settings in which agents invoke tools, shell
+commands, scripts, or binaries that access files, spawn processes, use the
+network, or interact with external services. The TCB includes the operating
+system kernel, the kernel enforcement mechanisms used by \SystemName, the
+\SystemName runtime, the SK-IR compiler and rule base, the policy installer, the
+ghost-policy manager, ShadowFS, and the semantic validator. We assume these
+components are not compromised or attacker-modifiable. Our goal is not to
+minimize the TCB, but to exclude the agent framework, generated actions, and
+invoked tools from it.
+
+The agent and all code it controls are untrusted, including prompts, model
+outputs, tool-selection logic, permission declarations, generated scripts,
+plugins, and launched binaries. Host-installed binaries receive no special
+trust; they execute under the same invocation-scoped policy as the selected tool.
+
+The semantic validator is trusted to authorize releases using a bounded context
+constructed by the runtime, including release-relevant information such as the
+user prompt, task status, history operations, and current tool intent. \SystemName
+does not infer user intent perfectly: if the trusted validator approves an unsafe
+release, \SystemName enforces that decision. The guarantee is that
+agent-generated actions cannot exceed the compiled kernel authority or become
+externally visible without validator approval.
+
+\subsection{Adversary Capabilities}
+\label{sec:threat:adversary}
+
+We consider adversaries that try to make an agent act outside the user's task
+semantics or beyond the authority compiled for an invocation. The adversary may
+control any agent-observed input, including prompts, documents, webpages,
+retrieved content, tool outputs, third-party responses, and data consumed by
+launched programs. These inputs may contain prompt injections, malicious
+instructions, or malformed data that induce excessive permissions, dangerous
+commands, unauthorized file access, sensitive-resource modification, or network
+exfiltration.
+
+Any program launched by the agent may be malicious. It may spawn helper
+processes, exploit path aliases or symbolic links, access resources through file
+descriptors or \texttt{/proc}, exercise ambient privileges, use network APIs for
+exfiltration, or otherwise attempt to evade confinement. The adversary may also
+craft permission declarations and tool parameters that stress the SK-IR compiler,
+including ambiguous paths, broad network destinations, malformed endpoints, and
+over-limit requests. \SystemName treats these inputs as untrusted and requires
+deterministic validation and fail-closed compilation; the adversary cannot modify
+the TCB.
+
+\subsection{Security Goals}
+\label{sec:threat:goals}
+
+\SystemName aims to provide the following properties.
+
+\paragraph{Mediation for modeled operations.}
+All modeled filesystem, process, privilege, and network operations are mediated
+at the operating-system boundary for managed invocations. Requests outside this
+modeled surface are rejected during compilation rather than executed with ambient
+authority.
+
+\paragraph{Invocation-scoped least privilege.}
+Before untrusted tool code runs, \SystemName installs an invocation-specific
+kernel policy derived from accepted permissions. The SK-IR compiler may
+normalize, validate, or narrow requested authority, but must not expand it;
+requests that cannot be safely compiled fail closed. Permissions are bound to
+the invocation and revoked on completion, failure, timeout, discard, or lease
+expiration.
+
+\paragraph{Fail-closed semantic release.}
+Agent-visible outputs, committed filesystem changes, and externally visible
+effects are released only after trusted semantic approval. Denial, timeout, or
+pre-approval failure discards speculative state and revokes authority.
+
+\paragraph{Controlled irreversible effects.}
+Irreversible external effects, such as network transmissions, API calls, and
+remote-service interactions, are release boundaries. They must be withheld or
+mediated until semantic authorization succeeds.
+
+\paragraph{Low-latency authorization.}
+\SystemName overlaps confined execution with semantic validation to reduce
+user-visible latency. This performance goal does not relax the above security
+properties: speculation changes when work is performed, not when unauthorized
+effects become visible.
+
+\subsection{Out of Scope}
+\label{sec:threat:out}
+
+\SystemName does not protect against compromise of the operating-system kernel,
+trusted kernel mechanisms, runtime, SK-IR compiler, ShadowFS, ghost-policy
+manager, or semantic validator. Bugs or compromise in these components may
+violate its guarantees. Side channels, hardware attacks, physical attacks,
+host-level denial of service, and resource-exhaustion attacks are outside scope;
+\SystemName denies release on failure but does not guarantee availability.
+
+\SystemName also does not determine absolute user intent. Incorrect approvals
+are trusted policy decisions, while incorrect denials may reduce utility without
+violating the stated safety properties. Finally, \SystemName prevents external
+effects from being released before authorization, but does not roll back effects
+that have already been externally observed.

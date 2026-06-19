@@ -1,0 +1,55 @@
+\section{Background and Motivation}
+
+\subsection{LLM Agents as System Principals}
+
+Recent LLM agents have evolved beyond conversational assistants into autonomous system operators capable of executing shell commands, manipulating filesystems, accessing external services, and coordinating multiple software tools. Frameworks such as LangChain, AutoGen, and emerging computer-use agents increasingly grant models direct access to operating-system resources in order to accomplish complex tasks.
+
+This capability fundamentally changes the security model of AI systems. In traditional applications, operating-system actions are ultimately determined by trusted program logic. In contrast, agent actions are partially generated through probabilistic reasoning over natural-language inputs and external observations. Failures such as hallucinations, prompt injections, tool compromise, or task misunderstanding can directly translate into filesystem modifications, command execution, network communication, or access to sensitive data.
+
+As agents become capable of invoking arbitrary binaries and interacting with untrusted software components, application-level mediation alone becomes insufficient. Security mechanisms must ultimately regulate resource accesses at the operating-system boundary, where all effects become observable and enforceable.
+
+\subsection{The Semantic Gap in Agent Authorization}
+
+Authorizing agent actions requires reasoning about intent. A filesystem access may be legitimate in one task context yet malicious in another. For example, reading configuration files may be necessary for debugging but inappropriate during document summarization. Determining whether an action should be permitted therefore depends on task semantics rather than solely on the accessed resource.
+
+However, operating-system security mechanisms reason using low-level primitives such as files, sockets, processes, and system calls. These primitives lack the semantic information necessary to determine whether a particular operation is consistent with the user's intent. Conversely, semantic information available to the agent is typically expressed through natural-language instructions, tool arguments, and execution context, none of which are directly consumable by kernel enforcement mechanisms.
+
+This mismatch creates a fundamental semantic gap between agent objectives and operating-system authorization. Effective protection requires both semantic understanding of agent intent and operating-system-level enforcement of resulting decisions.
+
+\subsection{Existing Approaches and the Three-Way Tradeoff}
+
+Recent work has explored several approaches for securing LLM agents.
+
+Semantic authorization systems attempt to incorporate task context into access-control decisions. Examples include context-aware authorization frameworks, task-specific policy generation systems, and DSL-based policy specification mechanisms. These approaches improve the semantic precision of authorization decisions by reasoning about user intent, task objectives, and execution context. However, they typically operate at the application layer and provide limited support for translating semantic decisions into kernel-enforceable protections. Moreover, most existing systems rely on coarse-grained configurations or per-request permission specifications, which are ill-suited for the highly dynamic and multi-step nature of LLM agents. A smaller subset of approaches perform per-invocation semantic validation before each tool execution, but this design introduces non-trivial runtime overhead, as it places LLM-based or semantic reasoning directly on the critical execution path.
+
+Another line of work performs runtime behavioral analysis of agent executions. By analyzing execution traces, information flows, or action dependencies, these systems can detect policy violations and unsafe behaviors that emerge during execution. While effective for identifying anomalous behavior, they generally focus on detection rather than immediate operating-system-level containment.
+
+A third class of defenses employs sandboxing and isolation mechanisms. These systems assume that agent failures are inevitable and instead limit their consequences through confinement. Such approaches provide strong enforcement guarantees because they rely on operating-system security primitives. However, isolation mechanisms typically lack the semantic information necessary to distinguish legitimate actions from malicious ones, forcing developers to choose between permissive and restrictive configurations.
+
+Collectively, these approaches expose a fundamental three-way tradeoff among semantic precision, enforcement strength, and execution latency. Semantic authorization improves contextual understanding but often requires expensive reasoning before actions can proceed. Kernel-level isolation provides strong containment but lacks semantic awareness. Runtime validation can achieve finer-grained control yet places semantic reasoning on the critical execution path, introducing substantial latency.To our knowledge, existing systems do not simultaneously provide all three properties.
+
+\subsection{Design Opportunity}
+
+The above tradeoff arises because existing systems often require semantic
+authorization to complete before execution can begin. This places semantic
+reasoning latency directly on the critical execution path. At the same time,
+purely kernel-level mechanisms lack the task context needed to decide whether a
+particular access is legitimate.
+
+The key opportunity is to separate \emph{kernel-enforced confinement} from
+\emph{semantic release authorization}. Before untrusted tool code runs, a
+runtime can install deterministic OS-level constraints that bound the tool's
+authority. The tool can then execute speculatively within this confined
+environment while semantic validation proceeds asynchronously.
+
+Many local effects, such as filesystem updates, can be isolated before they
+become host-visible. Rather than applying such effects directly to the host and
+rolling them back after denial, a runtime can record them in a speculative
+substrate and release them only after authorization succeeds. Irreversible
+effects, such as network transmissions and remote API calls, must instead be
+treated as release boundaries and withheld until approval.
+
+This motivates \SystemName, which combines deterministic kernel confinement with
+asynchronous semantic release authorization. Tools execute under bounded
+OS-level authority, while outputs and effects remain speculative until a trusted
+semantic validator approves their release.

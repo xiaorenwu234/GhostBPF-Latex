@@ -1,0 +1,101 @@
+\section{Introduction}
+
+Large language model (LLM) agents are rapidly evolving from conversational
+assistants into autonomous system operators capable of executing shell commands,
+manipulating filesystems, launching subprocesses, and interacting with complex
+software environments. This autonomy introduces a fundamental security
+challenge: hallucinations, prompt injections, compromised context, or malicious
+tools can be translated into concrete system actions at machine speed. We adopt
+a strict threat model: the host operating system and \SystemName's trusted
+runtime components are trusted, while the agent framework, its generated
+instructions, permission declarations, and invoked binaries are treated as
+potentially malicious.
+
+Existing agent deployments often grant tools broad filesystem and network
+access. In such settings, a single successful injection can exfiltrate sensitive
+files, corrupt project state, or interact with remote services on the user's
+behalf. Securing agents therefore requires authorization mechanisms that
+precisely constrain resource accesses according to the intended task. Because
+agents routinely invoke shells, interpreters, package managers, and arbitrary
+binaries, these constraints must ultimately be enforced at the operating-system
+boundary rather than only within the application framework.
+
+The central difficulty is the semantic gap between agent intent and kernel
+enforcement. Operating systems reason about files, sockets, capabilities,
+processes, and system calls, whereas agent objectives are expressed through
+natural-language instructions and tool invocations. Existing approaches attempt
+to bridge this gap using task-level sandboxing, LLM-generated policies, or
+per-invocation validation, but they face a three-way tension among semantic
+precision, enforcement strength, and execution latency. Coarse task-level
+policies fail to capture dynamic runtime behavior; per-invocation semantic
+validation improves precision but places LLM reasoning on the critical path; and
+kernel isolation provides strong enforcement but lacks task-level context.
+
+This paper argues that these properties need not be tightly coupled. Our key
+insight is to separate \emph{kernel-enforced confinement} from \emph{semantic
+release authorization}. Before untrusted tool code runs, the system installs a
+deterministic kernel policy that bounds the tool's authority. The tool then
+executes speculatively within that confined environment while a trusted semantic
+validator independently decides whether its outputs and effects may be released.
+Reversible local effects are isolated until approval, while irreversible effects,
+such as network transmissions and API calls, are treated as release boundaries
+and withheld until authorization succeeds. This hides semantic validation latency
+without creating an unconstrained execution window.
+
+We present \SystemName, a runtime security framework that combines semantic
+authorization, kernel-level enforcement, and speculative execution.
+\SystemName treats agent-supplied permission declarations as untrusted input. A
+deterministic compiler translates each declaration into a bounded, auditable,
+kernel-enforceable policy, which the runtime installs before transferring
+control to untrusted tool code. The tool executes under eBPF/LSM confinement,
+while a trusted semantic validator concurrently evaluates the task context,
+accepted permissions, and pending release request. Outputs, filesystem changes,
+and externally visible effects are released only after semantic approval;
+otherwise, speculative state is discarded and the invocation-scoped policy is
+revoked.
+
+\SystemName consists of three core mechanisms. First,
+\emph{Semantic-to-Kernel Intermediate Representation (SK-IR)} deterministically
+translates untrusted permission declarations into kernel-enforceable upper
+bounds on runtime authority. SK-IR does not decide whether a permission is
+semantically justified; instead, it validates, normalizes, and narrows requested
+authority, rejecting declarations that cannot be represented safely.
+
+Second, \emph{ghost policies} provide transient invocation-scoped enforcement
+contexts. \SystemName materializes SK-IR outputs as eBPF/LSM policies indexed by
+fresh cgroup v2 contexts, ensuring that tools and their descendants remain
+subject to the same least-privilege policy. Ghost policies are lease-bound and
+revoked when the invocation completes, fails, rolls back, times out, or expires.
+
+Third, \emph{speculative execution with ShadowFS} overlaps confined execution
+with semantic validation. Filesystem mutations are redirected into
+per-invocation copy-on-write overlays, and agent-visible outputs are buffered
+until approval. If authorization succeeds, approved state is committed and
+outputs are released; otherwise, overlays and buffered outputs are discarded
+before becoming host-visible. Irreversible operations are routed through
+mediated release paths and withheld until semantic approval succeeds.
+
+\FIXME{We implement \SystemName in Python, Go, and C on Linux. Evaluated against
+agent-security attacks including prompt injections, malicious tools, and
+privilege-escalation attempts, \SystemName blocks unauthorized actions with only
+\textbf{[X]}\% throughput overhead, while hiding up to \textbf{[Y]}\% of
+authorization latency (avg. \textbf{[Z]}s) for filesystem-intensive workloads.}
+
+In summary, this paper makes the following contributions:
+\begin{itemize}
+\item SK-IR, a deterministic semantic-to-kernel compilation framework that
+translates untrusted agent permission declarations into auditable,
+kernel-enforceable bounds on runtime authority.
+
+\item Ghost policies, transient invocation-scoped eBPF/LSM security contexts
+that bind least-privilege enforcement to individual tool executions and revoke
+authority automatically.
+
+\item Speculative execution with ShadowFS, which decouples semantic validation
+from tool execution by isolating reversible effects, buffering outputs, and
+mediating irreversible release boundaries.
+
+\item An implementation and evaluation of \SystemName, demonstrating that
+semantic release authorization can be combined with kernel-grade confinement
+while reducing authorization latency on the critical path.
+\end{itemize}

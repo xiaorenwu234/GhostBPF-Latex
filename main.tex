@@ -1,0 +1,59 @@
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix}
+
+\usepackage{tikz}
+\usepackage{amsmath}
+\usepackage{filecontents}
+\usepackage{xspace}
+\usepackage{enumitem}
+
+
+\begin{document}
+
+%don't want date printed
+\date{}
+
+\newcommand{\SystemName}{\textsc{GhostGuard}\xspace}
+
+\newcommand{\FIXME}[1]{\textcolor{red}{#1}}
+\newcommand{\FIXED}[1]{\textcolor{blue}{#1}}
+\newcommand{\RY}[1]{\textcolor{purple}{#1}}
+
+\title{\Large \bf \SystemName: Securing LLM Agents with Kernel-Enforced Least Privilege and Fail-Closed Release}
+
+%for single author (just remove % characters)
+\author{
+{\rm Your N.\ Here}\\
+Your Institution
+\and
+{\rm Second Name}\\
+Second Institution
+% copy the following lines to add more authors
+% \and
+% {\rm Name}\\
+%Name Institution
+} % end author
+
+
+\maketitle
+
+\input{sections/abstract}
+\input{sections/introduction}
+\input{sections/background}
+\input{sections/threat}
+\input{sections/design}
+
+
+\appendix
+\input{sections/ethical}
+
+
+\input{sections/open_science}
+
+
+\cleardoublepage
+\bibliographystyle{plain}
+\bibliography{references}
+
+
+\end{document}

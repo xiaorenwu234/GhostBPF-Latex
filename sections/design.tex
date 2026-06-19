@@ -1,0 +1,517 @@
+\section{Design}
+
+\subsection{System Overview}
+\label{sec:design:overview}
+
+Figure~\ref{fig:arch-overview} shows the architecture of \SystemName. The key
+idea is to decouple \emph{kernel-enforced confinement} from \emph{semantic
+release authorization}. \SystemName treats an agent's permission declaration as
+untrusted input: a deterministic SK-IR compiler first translates it into a
+bounded, kernel-enforceable upper bound, and the runtime installs the resulting
+policy before transferring control to untrusted tool code. The tool then runs
+speculatively under this policy while a trusted semantic validator concurrently
+decides whether the resulting outputs and effects may be released. This reduces
+authorization latency without creating an unconstrained execution window.
+
+\paragraph{Architecture and workflow.}
+A tool invocation proceeds in four steps. First, the agent submits a tool
+request and an untrusted permission declaration. Second, \SystemName compiles
+the declaration into SK-IR, rejecting requests that cannot be safely represented
+without expanding authority. The compiled SK-IR is materialized as an
+invocation-scoped eBPF/LSM policy, represented by a short-lived \emph{ghost}
+object and bound to the tool and its descendants. Third, the tool executes under
+kernel confinement while \textsc{ShadowFS} records tentative filesystem effects
+and buffers agent-visible outputs, including stdout, stderr, return values, and
+structured tool responses. In parallel, the semantic validator evaluates the
+task context, accepted permissions, and pending release request. Finally, if
+authorization succeeds, \SystemName commits the approved filesystem state and
+releases the approved outputs or external effects. If authorization is denied,
+times out, or fails before approval, \SystemName discards speculative state,
+suppresses buffered outputs, and revokes the corresponding ghost policy.
+
+Operations whose effects cannot be undone after release, such as network
+transmissions, API calls, and interactions with remote services, are treated as
+release boundaries. They are withheld or routed through mediated release paths
+until semantic approval is available; \SystemName does not rely on rolling back
+externally observed effects after the fact.
+
+\paragraph{Security invariants.}
+This workflow maintains three invariants.
+
+\begin{enumerate}[leftmargin=1.2em]
+\item \textbf{Confinement before untrusted execution.}
+Kernel enforcement is installed before untrusted tool code runs, so the tool
+never executes with ambient host authority.
+
+\item \textbf{Invocation-scoped least privilege.}
+Runtime authority is derived only from SK-IR accepted by the deterministic
+compiler and is bound to a single invocation. Permissions do not accumulate
+across tool calls and are revoked when the invocation completes, fails, times
+out, is discarded, or its lease expires.
+
+\item \textbf{Fail-closed release.}
+Agent-visible outputs, committed filesystem changes, and externally visible
+effects are released only after semantic approval. Denials, timeouts, and
+pre-approval failures discard speculative state and revoke the associated ghost
+policy.
+\end{enumerate}
+
+\subsection{SK-IR: Semantic-to-Kernel Translation}
+\label{sec:design:ir}
+
+The challenge in enforcing agent permissions is not only kernel enforcement,
+but translating high-level, untrusted permission declarations into
+kernel-enforceable constraints in a deterministic and auditable way. Directly
+allowing an LLM to generate low-level security policies would place semantic
+reasoning on the trusted enforcement path and make the resulting behavior
+difficult to verify. \SystemName therefore introduces the Semantic-to-Kernel
+Intermediate Representation (SK-IR), a rule-based translation layer between
+agent-declared permissions and kernel enforcement.
+
+SK-IR does not decide whether a requested permission is semantically justified.
+It compiles the agent's declaration into a precise, auditable upper bound on
+runtime authority. The semantic validator separately decides whether the
+accepted authority and the resulting pending effects are appropriate for the
+task context and may be released.
+
+SK-IR is designed around three goals:
+
+\begin{enumerate}[leftmargin=1.2em]
+\item \textbf{Determinism.}
+Translation is deterministic with respect to its explicit inputs, including the
+permission declaration, compiler version, host policy configuration, resolver
+snapshot, and invocation namespace state. It does not depend on LLM behavior.
+
+\item \textbf{Least-privilege preservation.}
+Translation may validate, normalize, and narrow requested permissions, but it
+must not expand authority. Declarations that cannot be compiled while
+preserving this narrowing relationship fail closed.
+
+\item \textbf{Auditability.}
+Each deployed enforcement rule can be traced back to the declaration and
+compiler decisions that produced it.
+\end{enumerate}
+
+\subsubsection{Hard-Boundary Validation}
+\label{sec:design:ir:hard}
+
+Before translation, each invocation passes through a hard-boundary validator
+that performs syntactic and schema-level checks, including tool registration,
+parameter validation, and permission-manifest integrity checks. Requests that
+reference unknown tools, contain unsupported parameters, or violate schema
+constraints are rejected before policy generation.
+
+Unlike semantic authorization, these checks require no inference. They provide a
+deterministic first line of defense against malformed or structurally invalid
+requests.
+
+\subsubsection{Multi-Level Translation}
+\label{sec:design:ir:translation}
+
+SK-IR defines translation as a partial deterministic function:
+
+\[
+\mathcal{T} : \textit{IntentIR} \rightharpoonup \textit{EnforcementIR}.
+\]
+
+\noindent The function is partial because not every permission declaration can
+be safely represented as kernel-enforceable authority. For accepted
+declarations, the compiler maintains an authority-narrowing invariant: under
+the compiler-defined authority ordering, the runtime authority represented by
+$\mathcal{T}(d)$ is no broader than the authority declared in $d$. If this
+relationship cannot be established, translation fails closed and no policy is
+emitted.
+
+\paragraph{IntentIR.}
+The entry point is a typed representation of the requested operation. Let
+$\mathcal{I}$ denote the closed set of supported intent types, such as file
+read, file write, network connect, and process execution. Each intent
+$d = (i, \pi)$ pairs an intent type $i \in \mathcal{I}$ with a per-type
+parameter record $\pi$ drawn from a fixed schema. Free-form policy fragments are
+excluded by construction: only parameter keys in a per-type whitelist $K_i$ are
+accepted.
+
+\paragraph{ConstraintIR.}
+The extraction pass transforms an intent into explicit resource-to-predicate
+bindings. It dispatches on the intent discriminator and applies a resource
+extraction function $\mathcal{E}_i$ specific to each supported intent type:
+
+\[
+\textsc{Extract}(i, \pi) =
+\bigl\langle
+  \mathcal{E}_i(\pi),\;
+  \textit{ops}(i),\;
+  \textsc{Allow}
+\bigr\rangle .
+\]
+
+\noindent The function $\mathcal{E}_i(\pi)$ yields a set of bound resources
+$\{(r_j, P_j)\}$, where each typed resource identifier $r_j$ is paired with a
+conjunction of constraint predicates $P_j$. For filesystem intents, the trusted
+runtime canonicalizes resources with respect to the invocation namespace and
+emits predicates over approved namespace roots, mount identifiers, path
+components, or stable object identifiers where available. Ambiguous cases,
+including unsafe symbolic-link traversal, unauthorized mount crossing, and
+sensitive pseudo-paths such as uncontrolled \texttt{/proc} aliases, are rejected
+rather than approximated with broader access. For network intents, endpoint
+descriptions are converted into predicates over address family, address or CIDR
+range, port, and protocol. Capability requests are recorded as symbolic
+capability sets.
+
+\paragraph{EnforcementIR.}
+The lowering pass rewrites each constraint predicate into a kernel-checkable
+form using a fixed set of rewrite rules:
+
+\begin{align}
+&\ell(\textit{Endpoint}(\textit{host}, \textit{port}, \textit{proto}))
+  \notag\\
+&\quad= \textit{AddrSet}\bigl(
+    \textsc{Resolve}(\textit{host}),
+    \textit{port},
+    \textit{proto}
+  \bigr)
+  \label{eq:endpoint} \\[3pt]
+&\ell(\textit{CapSet}(\{c_1, \ldots, c_k\}))
+  \notag\\
+&\quad= \textit{CapBitmask}\!\left(
+    \textstyle\bigvee_{j=1}^{k} 2^{\,\textit{bit}(c_j)}
+  \right)
+  \label{eq:cap} \\[3pt]
+&\ell(\textit{SockFamily}(\{f_1, \ldots, f_m\}))
+  \notag\\
+&\quad= \textit{FamilyBitmask}\!\left(
+    \textstyle\bigvee_{j=1}^{m} 2^{\,\textit{bit}(f_j)}
+  \right)
+  \label{eq:sock} \\[3pt]
+&\ell(\textit{Group}(\textit{op}, \overline{p}))
+  \notag\\
+&\quad= \textit{Group}(\textit{op},\, \overline{\ell(p)})
+  \label{eq:group}
+\end{align}
+
+\noindent Rule~\eqref{eq:endpoint} resolves host predicates using a trusted
+resolver at compilation time and seals the result as concrete address
+predicates with resolver metadata and TTL bounds. Resolution failure, unstable
+resolution, or policy-incompatible results cause fail-closed rejection. Single
+host addresses are represented as /32 IPv4 or /128 IPv6 masks. Rules
+\eqref{eq:cap} and~\eqref{eq:sock} compile symbolic name sets into bitmasks
+using static lookup tables that mirror the kernel's \texttt{CAP\_*} and
+\texttt{AF\_*} definitions. Rule~\eqref{eq:group} applies lowering recursively
+to composite predicates. Predicates that are already kernel-checkable are
+preserved; unsupported predicates are rejected rather than passed through.
+
+After predicate lowering, a static hook-selection function chooses a sufficient
+LSM hook set for the intent type and lowered predicate set:
+
+\[
+H = \textsc{HookSet}(i,\; \{\ell(p) \mid p \in \textstyle\bigcup_j P_j\}) .
+\]
+
+\noindent The compiler emits hook-indexed rule entries for the selected hook
+classes. The resulting \textit{EnforcementIR} is sealed with default-deny
+semantics for managed invocations: operations within the modeled surface that
+are not explicitly covered are rejected at the LSM hook level.
+
+Because each pass is a pure function of its typed inputs and explicit host
+state, requiring no shared mutable state, randomness, or model inference, the
+pipeline is reproducible given the same compiler version, host policy
+configuration, resolver snapshot, and invocation namespace state.
+
+\subsubsection{Policy Canonicalization}
+\label{sec:design:ir:normalize}
+
+Real-world permissions often contain composite conditions. SK-IR represents
+these conditions as logical predicates over resources and access modes, then
+canonicalizes them into a normal form for kernel evaluation. The canonical form
+maps directly to rule structures stored in eBPF maps, enabling efficient
+runtime checks while preserving the intended logical constraints.
+
+Canonicalization performs only semantics-preserving rewrites, such as sorting
+commutative predicate groups, eliminating duplicates, merging adjacent address
+ranges when doing so does not expand authority, and rejecting contradictory or
+unsupported combinations. If canonicalization would exceed configured rule-count
+or map-size bounds, \SystemName rejects the request instead of emitting a
+partial or overbroad policy.
+
+\subsection{Kernel-Level Enforcement via eBPF/LSM}
+\label{sec:design:ebpf}
+
+The output of SK-IR is an \texttt{EnforcementIR} that specifies the
+kernel-enforceable upper bound for a tool invocation. The enforcement layer is
+responsible for installing this bound before untrusted tool code runs, binding
+it to the corresponding invocation, and revoking it when the invocation
+terminates or its authorization lease expires.
+
+\SystemName realizes \texttt{EnforcementIR} as eBPF programs attached to Linux
+Security Module (LSM) hooks. The runtime places each tool invocation in a fresh
+cgroup v2 context, and LSM hooks use this context to select a short-lived
+\emph{ghost} policy. This design keeps low-level access-control decisions in
+the kernel, while policy construction, provenance tracking, and semantic
+release authorization remain in the trusted runtime.
+
+\subsubsection{Invocation-Scoped Policy Enforcement}
+\label{sec:design:ebpf:cgroup}
+
+Authorization state must be scoped to a single tool invocation. Process
+identifiers are unsuitable because they can be recycled and do not naturally
+represent descendant processes created by a tool. Instead, \SystemName binds
+each invocation to a fresh cgroup v2 subtree.
+
+Before transferring control to untrusted tool code, the trusted runtime creates
+the cgroup, installs the ghost policy state, sanitizes inherited file
+descriptors, and places the tool process in the cgroup. Forked and
+\texttt{execve}'d descendants inherit the same cgroup membership and therefore
+remain subject to the same policy. At each covered LSM hook, the eBPF program
+obtains the current cgroup identifier using
+\texttt{bpf\_get\_current\_cgroup\_id()} and performs a bounded lookup for the
+active ghost policy.
+
+For cgroups managed by \SystemName, missing, expired, or malformed ghost state
+is treated as a denial. Confined processes are also prevented from migrating out
+of their assigned cgroup, for example by denying access to cgroup control files
+and excluding cgroup management interfaces from the confined namespace. This
+binds authorization state to the invocation context and prevents permissions
+from being reused across concurrent tool invocations.
+
+\subsubsection{LSM-Based Policy Enforcement}
+\label{sec:design:ebpf:hooks}
+
+\SystemName enforces the resource classes modeled by SK-IR through a fixed set
+of LSM hook classes. Requests requiring operations outside this modeled surface
+are rejected during compilation. Within the modeled surface, unmatched runtime
+operations are denied by default.
+
+\paragraph{Filesystem access.}
+Filesystem policies constrain authorized objects and access modes, including
+read, write, create, unlink, and rename. Enforcement covers both path-based and
+file-descriptor-based operations, including file open, path modification,
+permission checks on existing descriptors, executable mappings, and controlled
+file-descriptor transfer. The trusted runtime resolves and canonicalizes policy
+resources before installation. Kernel hooks evaluate bounded predicates over
+precomputed mount, inode, file, and namespace identifiers, rather than
+performing semantic path resolution in the hot path. Ambiguous cases, such as
+paths whose normalization crosses unauthorized mount or symbolic-link
+boundaries, are rejected during compilation rather than approximated with
+broader access.
+
+\paragraph{Network access.}
+Network policies operate on kernel-checkable predicates, including address
+family, protocol, destination address or CIDR range, and port. Hostnames and
+other semantic endpoint descriptions are resolved before policy installation;
+if they cannot be converted into stable predicates, compilation fails closed.
+Because network transmissions are irreversible release events, direct external
+network access is gated by the ghost's release state. Before semantic approval,
+the policy denies direct external transmissions except through trusted mediated
+release paths. After approval, connection attempts or datagram transmissions
+must still match the installed endpoint predicates.
+
+\paragraph{Process and privilege control.}
+Additional hooks restrict process creation, executable loading, capability use,
+and executable memory mappings. The runtime clears ambient authority, prevents
+privilege-changing transitions, and ensures helper processes remain in the same
+invocation cgroup. These checks prevent confined tools from escaping their
+declared authority through descendant processes, privileged executables,
+unexpected capabilities, or executable code outside the compiled policy.
+
+All hook programs implement default-deny semantics for managed cgroups. If an
+operation within the modeled surface is not matched by the active ghost policy,
+the kernel rejects the operation.
+
+\subsubsection{Ghost Policies}
+\label{sec:design:ebpf:lifecycle}
+
+A \emph{ghost} is the runtime representation of an invocation-specific kernel
+policy. Each ghost contains the hot-path enforcement state, the target cgroup
+identifier, lease state, release state, and a provenance identifier; the trusted
+runtime stores the full provenance record.
+
+Ghosts are created immediately before untrusted execution begins and become
+active once their eBPF map entries are installed. During execution, covered
+security-sensitive operations issued by the confined process are mediated using
+the ghost state associated with the current cgroup.
+
+Ghosts are reclaimed when the invocation completes, is discarded, times out, or
+fails. Reclamation removes the corresponding policy entries and releases
+execution-specific resources. Each ghost also carries an expiration time checked
+by the hook programs; expired ghosts fail closed even if userspace cleanup is
+delayed. This lease-based design prevents stale authorization state from
+granting privileges after the intended invocation lifetime.
+
+\paragraph{Security properties.}
+The enforcement layer maintains three properties:
+
+\begin{enumerate}[leftmargin=1.2em]
+\item \textbf{Confinement before untrusted execution.}
+The runtime installs the ghost policy and assigns the tool to its cgroup before
+transferring control to untrusted tool code.
+
+\item \textbf{Invocation isolation.}
+Authorization state is indexed by the invocation's cgroup and is not shared
+across independently launched tool invocations.
+
+\item \textbf{Ephemeral privilege.}
+Permissions are valid only for the lifetime and release state of the
+corresponding ghost and are revoked on completion, discard, timeout, failure,
+or lease expiration.
+\end{enumerate}
+
+\subsection{Speculative Execution with ShadowFS}
+\label{sec:design:speculative}
+
+A fundamental challenge in intent-driven authorization is the latency of
+semantic verification. Determining whether a requested permission is consistent
+with user intent requires invoking a trusted semantic guard, which typically
+incurs hundreds to thousands of milliseconds of latency. A straightforward
+design would block tool execution until authorization completes, placing LLM
+reasoning directly on the critical path.
+
+\SystemName avoids this bottleneck through \emph{speculative execution under
+kernel confinement}. The key observation is that semantic authorization need
+not complete before confined tool execution begins; it must complete before the
+results of that execution are released. \SystemName therefore allows a tool to
+execute under the eBPF/LSM policy derived from SK-IR while treating outputs and
+filesystem updates as speculative, and treating externally visible effects as
+mediated release requests.
+
+This design decouples \emph{enforcement} from \emph{release synchronization}:
+kernel confinement is established before untrusted tool code runs, while
+semantic validation proceeds asynchronously in the background.
+
+\subsubsection{Execution Model}
+\label{sec:design:speculative:protocol}
+
+Figure~\ref{fig:speculation} illustrates the execution workflow.
+
+After SK-IR compilation succeeds, \SystemName installs the corresponding ghost
+policy and launches the tool under kernel confinement. Two activities then
+proceed concurrently:
+
+\begin{enumerate}[leftmargin=1.2em]
+\item \textbf{Confined speculative execution.}
+The tool executes using only the authority granted by the installed eBPF/LSM
+policy. Filesystem mutations are redirected to ShadowFS, and tool outputs are
+buffered as speculative results rather than immediately returned to the agent.
+
+\item \textbf{Semantic authorization.}
+The semantic guard evaluates the task context, accepted permissions, and the
+pending release request, including buffered outputs and filesystem or external
+effects.
+\end{enumerate}
+
+Unlike a blocking authorization design, \SystemName allows confined execution
+to overlap with semantic verification. However, authorization synchronization
+is required before any speculative effect crosses a release boundary. Release
+boundaries include exposing tool output to the agent, committing filesystem
+updates to the host environment, issuing externally visible network or API
+effects, and allowing a subsequent non-speculative action to depend on
+speculative state.
+
+As a result, semantic verification latency can often be absorbed by tool
+execution time and by the agent's planning time between release points, reducing
+authorization overhead on the critical path without exposing unauthorized
+results.
+
+\subsubsection{ShadowFS Overlay}
+\label{sec:design:speculative:shadowfs}
+
+ShadowFS is a FUSE-based copy-on-write overlay that isolates speculative
+filesystem state from the underlying host filesystem. Each invocation receives
+an invocation-local writable overlay. Reads observe committed state and any
+explicitly tracked speculative dependencies that the runtime allows the
+invocation to consume, while writes, creates, deletes, renames, and metadata
+updates are recorded in the overlay rather than applied directly to the host
+filesystem.
+
+Because host state is not modified during speculative execution, denial does
+not require compensating updates to undo host-visible effects. If semantic
+authorization fails, times out, or the invocation crashes, \SystemName discards
+the invocation's overlay and buffered outputs and revokes the associated ghost
+policy. The unauthorized execution therefore leaves no committed local state.
+
+If authorization succeeds, \SystemName promotes the speculative overlay through
+a bounded commit protocol. Updates that can be made visible atomically, such as
+single-file replacement via rename, are committed directly. Multi-object
+updates are serialized under runtime control and become visible only after the
+dependency closure has been authorized. Before promotion, the runtime
+revalidates the base objects and policy predicates used during speculation. If
+committed host state has changed in a way that invalidates the recorded
+dependency or authorization context, promotion fails closed. Operations that
+cannot be committed without violating filesystem boundaries, policy
+constraints, or crash-safety requirements are rejected rather than approximated
+with broader authority.
+
+\subsubsection{Handling Irreversible Operations}
+\label{sec:design:speculative:irreversible}
+
+Not all operations can be made safe through filesystem isolation. Externally
+visible operations, such as outbound network communication, API invocations,
+IPC to host services, or interactions with remote systems, cannot be undone
+once released.
+
+\SystemName therefore treats irreversible operations as release boundaries.
+Direct external sockets from confined code are denied before release approval.
+Tools that require irreversible effects must issue them through a trusted
+runtime mediation endpoint, which records the pending effect and releases it
+only after approval. If the semantic guard has not yet approved the
+corresponding release request, the mediation path withholds the effect and
+prevents it from becoming externally observable. Upon approval, the effect is
+released subject to both the semantic decision and the installed kernel policy.
+Upon denial, timeout, or failure, the pending effect is discarded and the ghost
+policy is reclaimed.
+
+This design preserves speculation for reversible local computation while
+preventing unauthorized irreversible effects from becoming externally visible.
+
+\subsubsection{Dependency-Aware Consistency}
+\label{sec:design:speculative:dependency}
+
+Speculative execution introduces consistency challenges when multiple tool
+invocations interact through shared state. A later invocation may read data
+produced by an earlier speculative invocation whose semantic authorization has
+not yet completed.
+
+To preserve causal consistency, ShadowFS tracks dependencies between
+speculative invocations. When an invocation reads data from another uncommitted
+overlay or consumes a speculative tool output, the runtime records a dependency
+edge. A dependent invocation may continue executing speculatively over this
+merged view, but its own outputs and filesystem effects cannot be released
+until all upstream dependencies have been authorized.
+
+If an upstream invocation is denied, times out, or fails, \SystemName discards
+that invocation's overlay and recursively discards the speculative state of any
+dependent invocations. This ensures that committed state and agent-visible
+outputs never depend on data produced by an unauthorized execution.
+
+\subsubsection{Security Analysis}
+\label{sec:design:speculative:safety}
+
+Speculative execution preserves the security guarantees established by
+\SystemName because speculation changes when effects are released, not what
+authority the tool receives.
+
+\paragraph{Confinement before untrusted execution.}
+The ghost policy is installed and the tool is assigned to its cgroup before
+untrusted tool code begins execution. Speculation therefore does not introduce
+an unconstrained execution window.
+
+\paragraph{Least-privilege preservation.}
+Speculative execution does not expand the authority available to the tool.
+Throughout execution, covered security-sensitive operations remain subject to
+the kernel policy compiled from SK-IR.
+
+\paragraph{Fail-closed visibility.}
+Semantic denial, timeout, crash, or internal failure prevents speculative
+effects from crossing release boundaries. Buffered outputs are discarded,
+uncommitted overlays are removed, and the corresponding ghost policy is
+revoked.
+
+\paragraph{External side-effect safety.}
+Irreversible operations are treated as release boundaries and are never
+externally issued before semantic authorization succeeds. Unauthorized
+invocations therefore cannot produce network-visible, API-visible, or
+host-service-visible effects.
+
+The critical observation is that ShadowFS does not rely on undoing
+unauthorized host modifications after the fact. Instead, it prevents
+speculative effects from becoming observable until semantic authorization
+succeeds, and discards them if authorization fails.
